@@ -7,6 +7,7 @@ Qt/C++ 对WinPty、ConPty和标准Unix Pty的封装易用库。从 https://githu
 - 原项目在windows上使用conpty的情况下存在当终端输出大量数据时程序主进程卡死情况，现在参考qt-creator源码中部分代码，拣选修改解决了这个问题。
 - 完善（增加）了启动PTY设置WorkDir、Environment功能，三种pty均可以使用。
 - 增加了hasChildProcess、processInfoTree接口，三种pty均可以使用。
+- conpty增加了setResizeQuirk接口，用于适配是否支持window conhost resizequirk行为。
 - 增加qmake构建支持，通过 include(./lib/ptyqt.pri) 引入即可，极为方便通过源码引入其他项目。
 
 一些注意：
