@@ -20,7 +20,7 @@ int main(int argc, char *argv[])
     centralwidget->setLayout(verticalLayout);
     QPlainTextEdit *recv = new QPlainTextEdit(mainWindow);
     QLineEdit *send = new QLineEdit(mainWindow);
-    QPushButton *sendButton = new QPushButton(mainWindow);
+    QPushButton *sendButton = new QPushButton("send",mainWindow);
     recv->setReadOnly(true);
     verticalLayout->addWidget(recv);
     verticalLayout->addWidget(send);
