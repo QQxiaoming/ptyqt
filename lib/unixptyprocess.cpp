@@ -1,15 +1,7 @@
 #include "unixptyprocess.h"
 #include <QStandardPaths>
 
-#include <termios.h>
-#include <errno.h>
-#if !defined(Q_OS_ANDROID) && !defined(Q_OS_FREEBSD)
-#include <utmpx.h>
-#endif
-#include <fcntl.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
-#include <stdlib.h>
+#include <QDir>
 #include <QFileInfo>
 #include <QCoreApplication>
 
@@ -25,7 +17,12 @@ UnixPtyProcess::~UnixPtyProcess()
     kill();
 }
 
-bool UnixPtyProcess::startProcess(const QString &shellPath, QStringList environment, qint16 cols, qint16 rows)
+bool UnixPtyProcess::startProcess(const QString &executable,
+                                 const QStringList &arguments,
+                                 const QString &workingDir,
+                                 QStringList environment,
+                                 qint16 cols,
+                                 qint16 rows)
 {
     if (!isAvailable())
     {
@@ -36,15 +33,15 @@ bool UnixPtyProcess::startProcess(const QString &shellPath, QStringList environm
     if (m_shellProcess.state() == QProcess::Running)
         return false;
 
-    QFileInfo fi(shellPath);
-    if (fi.isRelative() || !QFile::exists(shellPath))
+    QFileInfo fi(executable);
+    if (fi.isRelative() || !QFile::exists(executable))
     {
         //todo add auto-find executable in PATH env var
         m_lastError = QString("UnixPty Error: shell file path must be absolute");
         return false;
     }
 
-    m_shellPath = shellPath;
+    m_shellPath = executable;
     m_size = QPair<qint16, qint16>(cols, rows);
 
     int rc = 0;
@@ -185,10 +182,7 @@ bool UnixPtyProcess::startProcess(const QString &shellPath, QStringList environm
     defaultVars.append("ITERM_PROFILE=Default");
     defaultVars.append("XPC_FLAGS=0x0");
     defaultVars.append("XPC_SERVICE_NAME=0");
-    defaultVars.append("LANG=en_US.UTF-8");
-    defaultVars.append("LC_ALL=en_US.UTF-8");
-    defaultVars.append("LC_CTYPE=UTF-8");
-    defaultVars.append("INIT_CWD=" + QCoreApplication::applicationDirPath());
+    defaultVars.append("INIT_CWD=" + workingDir);
     defaultVars.append("COMMAND_MODE=unix2003");
     defaultVars.append("COLORTERM=truecolor");
 
@@ -205,15 +199,22 @@ bool UnixPtyProcess::startProcess(const QString &shellPath, QStringList environm
             environment.append(defVar);
     }
 
-    QProcessEnvironment envFormat;
+    QProcessEnvironment envFormat = QProcessEnvironment::systemEnvironment();
     foreach (QString line, environment)
     {
-        envFormat.insert(line.split("=").first(), line.split("=").last());
+        if(envFormat.contains(line.split("=").first())) {
+            envFormat.remove(line.split("=").first());
+            envFormat.insert(line.split("=").first(), line.split("=").last());
+        } else {
+            envFormat.insert(line.split("=").first(), line.split("=").last());
+        }
     }
-    m_shellProcess.setWorkingDirectory(QCoreApplication::applicationDirPath());
+    m_shellProcess.setWorkingDirectory(workingDir);
     m_shellProcess.setProcessEnvironment(envFormat);
     m_shellProcess.setReadChannel(QProcess::StandardOutput);
-    m_shellProcess.start(m_shellPath, QStringList());
+
+
+    m_shellProcess.start(m_shellPath, arguments);
     m_shellProcess.waitForStarted();
 
     m_pid = m_shellProcess.processId();
@@ -312,6 +313,70 @@ qint64 UnixPtyProcess::write(const QByteArray &byteArray)
     return byteArray.size();
 }
 
+QString UnixPtyProcess::currentDir()
+{
+    return QDir::currentPath();
+}
+
+bool UnixPtyProcess::hasChildProcess()
+{
+    pidTree_t pidTree = processInfoTree();
+    return (pidTree.children.size() > 0);
+}
+
+UnixPtyProcess::pidTree_t UnixPtyProcess::processInfoTree()
+{
+    QList<psInfo_t> psInfoList;
+    QString cmd = QString("ps");
+    QStringList args = { "-o", "pid,ppid,command", "-ax" };
+    QProcess ps;
+    ps.start(cmd, args);
+    ps.waitForFinished(-1);
+    QString psResult = ps.readAllStandardOutput();
+    QStringList psLines = psResult.split("\n");
+    foreach (QString line, psLines)
+    {
+        if (line.contains("PID"))
+            continue;
+
+        QStringList lineParts = line.split(" ");
+        QStringList linePartsFiltered;
+        foreach (QString part, lineParts)
+        {
+            if (!part.isEmpty())
+                linePartsFiltered.append(part);
+        }
+        if (linePartsFiltered.size() < 3)
+            continue;
+
+        struct psInfo_t info;
+        info.pid = linePartsFiltered.at(0).toLongLong();
+        info.ppid = linePartsFiltered.at(1).toLongLong();
+        info.command = linePartsFiltered.at(2);
+        info.args = linePartsFiltered.mid(3);
+        psInfoList.append(info);
+    }
+
+    std::function<QList<pidTree_t>(qint64)> findChild = [&](qint64 pid) -> QList<pidTree_t> {
+            QList<pidTree_t> result;
+            foreach (psInfo_t info, psInfoList)
+            {
+                if (info.ppid == pid)
+                {
+                    pidTree_t tree;
+                    tree.pidInfo.pid = info.pid;
+                    tree.pidInfo.ppid = info.ppid;
+                    tree.pidInfo.command = info.command;
+                    tree.children = findChild(info.pid);
+                    result.append(tree);
+                }
+            }
+            return result;
+        };
+    pidTree_t tree = { { m_pid, 0, m_shellPath, QStringList() }, findChild(m_pid) };
+    return tree;
+}
+
 bool UnixPtyProcess::isAvailable()
 {
 	//todo check something more if required
@@ -323,49 +388,3 @@ void UnixPtyProcess::moveToThread(QThread *targetThread)
     m_shellProcess.moveToThread(targetThread);
 }
 
-void ShellProcess::setupChildProcess()
-{
-    dup2(m_handleSlave, STDIN_FILENO);
-    dup2(m_handleSlave, STDOUT_FILENO);
-    dup2(m_handleSlave, STDERR_FILENO);
-
-    pid_t sid = setsid();
-    ioctl(m_handleSlave, TIOCSCTTY, 0);
-    tcsetpgrp(m_handleSlave, sid);
-
-#if !defined(Q_OS_ANDROID) && !defined(Q_OS_FREEBSD)
-    // on Android imposible to put record to the 'utmp' file
-    struct utmpx utmpxInfo;
-    memset(&utmpxInfo, 0, sizeof(utmpxInfo));
-
-    strncpy(utmpxInfo.ut_user, qgetenv("USER"), sizeof(utmpxInfo.ut_user));
-
-    QString device(m_handleSlaveName);
-    if (device.startsWith("/dev/"))
-        device = device.mid(5);
-
-    const char *d = device.toLatin1().constData();
-
-    strncpy(utmpxInfo.ut_line, d, sizeof(utmpxInfo.ut_line));
-
-    strncpy(utmpxInfo.ut_id, d + strlen(d) - sizeof(utmpxInfo.ut_id), sizeof(utmpxInfo.ut_id));
-
-    struct timeval tv;
-    gettimeofday(&tv, 0);
-    utmpxInfo.ut_tv.tv_sec = tv.tv_sec;
-    utmpxInfo.ut_tv.tv_usec = tv.tv_usec;
-
-    utmpxInfo.ut_type = USER_PROCESS;
-    utmpxInfo.ut_pid = getpid();
-
-    utmpxname(_PATH_UTMPX);
-    setutxent();
-    pututxline(&utmpxInfo);
-    endutxent();
-
-#if !defined(Q_OS_UNIX)
-    updwtmpx(_PATH_UTMPX, &loginInfo);
-#endif
-
-#endif
-}

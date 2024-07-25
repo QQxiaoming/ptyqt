@@ -1,8 +1,12 @@
 #include "winptyprocess.h"
+#include <windows.h> 
+#include <tlhelp32.h>
+#include <psapi.h>
 #include <QFile>
 #include <QFileInfo>
 #include <sstream>
 #include <QCoreApplication>
+#include <QDir>
 
 #define DEBUG_VAR_LEGACY "WINPTYDBG"
 #define DEBUG_VAR_ACTUAL "WINPTY_DEBUG"
@@ -22,7 +26,6 @@ WinPtyProcess::WinPtyProcess()
     , m_inSocket(nullptr)
     , m_outSocket(nullptr)
 {
-
 }
 
 WinPtyProcess::~WinPtyProcess()
@@ -30,7 +33,12 @@ WinPtyProcess::~WinPtyProcess()
     kill();
 }
 
-bool WinPtyProcess::startProcess(const QString &shellPath, QStringList environment, qint16 cols, qint16 rows)
+bool WinPtyProcess::startProcess(const QString &executable,
+                                 const QStringList &arguments,
+                                 const QString &workingDir,
+                                 QStringList environment,
+                                 qint16 cols,
+                                 qint16 rows)
 {
     if (!isAvailable())
     {
@@ -42,15 +50,15 @@ bool WinPtyProcess::startProcess(const QString &shellPath, QStringList environme
     if (m_ptyHandler != nullptr)
         return false;
 
-    QFileInfo fi(shellPath);
-    if (fi.isRelative() || !QFile::exists(shellPath))
+    QFileInfo fi(executable);
+    if (fi.isRelative() || !QFile::exists(executable))
     {
         //todo add auto-find executable in PATH env var
         m_lastError = QString("WinPty Error: shell file path must be absolute");
         return false;
     }
 
-    m_shellPath = shellPath;
+    m_shellPath = executable;
     m_size = QPair<qint16, qint16>(cols, rows);
 
 #ifdef PTYQT_DEBUG
@@ -99,10 +107,12 @@ bool WinPtyProcess::startProcess(const QString &shellPath, QStringList environme
     }
     winpty_error_free(errorPtr);
 
+    QString commandLine = fi.fileName() + " " + arguments.join(" ");
     //create spawn config
-    winpty_spawn_config_t* spawnConfig = winpty_spawn_config_new(WINPTY_SPAWN_FLAG_AUTO_SHUTDOWN, m_shellPath.toStdWString().c_str(),
-                                                                 //commandLine.toStdWString().c_str(), cwd.toStdWString().c_str(),
-                                                                 NULL, NULL,
+    winpty_spawn_config_t* spawnConfig = winpty_spawn_config_new(WINPTY_SPAWN_FLAG_AUTO_SHUTDOWN, 
+                                                                 m_shellPath.toStdWString().c_str(),
+                                                                 arguments.count()? commandLine.toStdWString().c_str():NULL,
+                                                                 workingDir.toStdWString().c_str(),
                                                                  env.c_str(),
                                                                  &errorPtr);
 
@@ -231,15 +241,77 @@ qint64 WinPtyProcess::write(const QByteArray &byteArray)
     return m_inSocket->write(byteArray);
 }
 
+QString WinPtyProcess::currentDir()
+{
+    return QDir::currentPath();
+}
+
+bool WinPtyProcess::hasChildProcess()
+{
+    pidTree_t pidTree = processInfoTree();
+    return (pidTree.children.size() > 0);
+}
+
+WinPtyProcess::pidTree_t WinPtyProcess::processInfoTree()
+{
+    QList<psInfo_t> psInfoList;
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0); 
+
+    if (snapshot == INVALID_HANDLE_VALUE)  {
+        pidTree_t tree = { { m_pid, 0, m_shellPath, QStringList() }, QList<pidTree_t>() };
+        return tree;
+    }
+
+    PROCESSENTRY32 pe;
+    pe.dwSize = sizeof(PROCESSENTRY32);
+
+    if (Process32First(snapshot, &pe)) {
+        do {
+            // get full path
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
+            if (hProcess != NULL)
+            {
+                TCHAR szProcessName[MAX_PATH] = TEXT("<unknown>");
+                if (GetModuleFileNameExW(hProcess, NULL, szProcessName, MAX_PATH) != 0)
+                {
+                    struct psInfo_t info;
+                    info.pid = pe.th32ProcessID;
+                    info.ppid = pe.th32ParentProcessID;
+                    info.command = QString::fromWCharArray(szProcessName);
+                    psInfoList.append(info);
+                }
+                CloseHandle(hProcess);
+            }
+        } while (Process32Next(snapshot, &pe));
+    }
+
+    CloseHandle(snapshot);
+
+    std::function<QList<pidTree_t>(qint64)> findChild = [&](qint64 pid) -> QList<pidTree_t> {
+            QList<pidTree_t> result;
+            foreach (psInfo_t info, psInfoList)
+            {
+                if (info.ppid == pid)
+                {
+                    pidTree_t tree;
+                    tree.pidInfo.pid = info.pid;
+                    tree.pidInfo.ppid = info.ppid;
+                    tree.pidInfo.command = info.command;
+                    tree.children = findChild(info.pid);
+                    result.append(tree);
+                }
+            }
+            return result;
+        };
+    pidTree_t tree = { { m_pid, 0, m_shellPath, QStringList() }, findChild(m_pid) };
+    return tree;
+}
+
 bool WinPtyProcess::isAvailable()
 {
-#ifdef PTYQT_BUILD_STATIC
-    return QFile::exists(QCoreApplication::applicationDirPath() + "/" + WINPTY_AGENT_NAME);
-#elif PTYQT_BUILD_DYNAMIC
     return QFile::exists(QCoreApplication::applicationDirPath() + "/" + WINPTY_AGENT_NAME)
             && QFile::exists(QCoreApplication::applicationDirPath() + "/" + WINPTY_DLL_NAME);
-#endif
-
 }
 
 void WinPtyProcess::moveToThread(QThread *targetThread)
