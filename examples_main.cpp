@@ -37,7 +37,18 @@ int main(int argc, char *argv[])
 
     QObject::connect(localShell->notifier(), &QIODevice::readyRead, [=](){
         QByteArray data = localShell->readAll();
-        recv->appendPlainText(QString::fromUtf8(data));
+        if (!data.isEmpty()) {
+            recv->appendPlainText(QString::fromUtf8(data));
+        }
+    });
+    QObject::connect(localShell->notifier(), &QIODevice::aboutToClose, [=](){
+        if (localShell) {
+            QByteArray restOfOutput = localShell->readAll();
+            if (!restOfOutput.isEmpty()) {
+                recv->appendPlainText(QString::fromUtf8(restOfOutput));
+                localShell->notifier()->disconnect();
+            }
+        }
     });
     QObject::connect(sendButton, &QPushButton::clicked, [=](){
         QString cmd = send->text() + "\n";
